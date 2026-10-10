@@ -349,3 +349,48 @@ fn now_iso_shape() {
     assert_eq!(t.len(), 20, "{t}");
     assert!(t.ends_with('Z') && &t[4..5] == "-");
 }
+
+#[test]
+fn failed_compound_preserves_saved_history_identity() {
+    for initially_dirty in [false, true] {
+        let mut s = session(8, 8, 8);
+        s.execute("edit.fill", json!({"color": "#ff0000"})).unwrap();
+        s.active_mut().unwrap().saved_to("saved.pcraft".into());
+        if initially_dirty {
+            s.execute("edit.fill", json!({"color": "#0000ff"})).unwrap();
+        }
+        let before = s.active().unwrap().doc.clone();
+        let entries = s.active().unwrap().history.entries();
+        let result: Result<()> = compound(&mut s, "Failed Compound", |s| {
+            s.execute("edit.fill", json!({"color": "#00ff00"}))?;
+            Err(EngineError::Other("injected failure".into()))
+        });
+        assert!(result.is_err());
+        assert!(Arc::ptr_eq(&before, &s.active().unwrap().doc));
+        assert_eq!(s.active().unwrap().history.entries(), entries);
+        assert_eq!(s.active().unwrap().is_dirty(), initially_dirty);
+        assert!(s.undo());
+        assert_eq!(s.active().unwrap().is_dirty(), !initially_dirty);
+        assert!(s.redo());
+        assert_eq!(s.active().unwrap().is_dirty(), initially_dirty);
+    }
+}
+
+#[test]
+fn compound_edit_restores_the_saved_state_as_one_step() {
+    let mut s = session(8, 8, 8);
+    s.execute("edit.fill", json!({"color": "#ff0000"})).unwrap();
+    s.active_mut().unwrap().saved_to("saved.pcraft".into());
+    let steps = s.active().unwrap().history.past_len();
+    compound(&mut s, "Two Fills", |s| {
+        s.execute("edit.fill", json!({"color": "#00ff00"}))?;
+        s.execute("edit.fill", json!({"color": "#0000ff"}))
+    })
+    .unwrap();
+    assert_eq!(s.active().unwrap().history.past_len(), steps + 1);
+    assert!(s.active().unwrap().is_dirty());
+    assert!(s.undo());
+    assert!(!s.active().unwrap().is_dirty());
+    assert!(s.redo());
+    assert!(s.active().unwrap().is_dirty());
+}

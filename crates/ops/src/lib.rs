@@ -33,6 +33,8 @@ pub struct HistoryState {
     pub doc: Arc<Document>,
     /// The layers targeted when this state was created.
     pub layers: LayerTarget,
+    /// Identity of the content, independent of its position in the undo stack.
+    identity: Arc<()>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +52,9 @@ pub struct History {
     current_label: String,
     /// The layers targeted when the current document was created (opened or edited).
     current_layers: LayerTarget,
+    current_identity: Arc<()>,
+    /// Only a token is retained: a savepoint must not keep evicted pixel data alive.
+    saved_identity: Option<Arc<()>>,
 }
 
 impl Default for History {
@@ -68,6 +73,8 @@ impl History {
             max_bytes: 0,
             current_label: "Open".into(),
             current_layers: LayerTarget::default(),
+            current_identity: Arc::new(()),
+            saved_identity: None,
         }
     }
 
@@ -82,7 +89,8 @@ impl History {
         }
         let prev_label = std::mem::replace(&mut self.current_label, label.into());
         let prev_layers = std::mem::replace(&mut self.current_layers, layers);
-        self.undo.push_back(HistoryState { label: prev_label, doc: before, layers: prev_layers });
+        let identity = std::mem::replace(&mut self.current_identity, Arc::new(()));
+        self.undo.push_back(HistoryState { label: prev_label, doc: before, layers: prev_layers, identity });
         self.clear_redo();
         while self.undo.len() > self.max_states {
             if let Some(state) = self.undo.pop_front()
@@ -116,6 +124,27 @@ impl History {
         self.current_layers = layers;
     }
 
+    /// Remember the current content as saved, without retaining its document or pixels.
+    pub fn mark_saved(&mut self) {
+        self.saved_identity = Some(self.current_identity.clone());
+    }
+
+    /// Whether undo/redo has returned to the exact state most recently marked saved.
+    pub fn is_saved(&self) -> bool {
+        self.saved_identity.as_ref().is_some_and(|saved| Arc::ptr_eq(saved, &self.current_identity))
+    }
+
+    /// Invalidate a savepoint whose content is no longer known (for example, crash recovery).
+    pub fn forget_saved(&mut self) {
+        self.saved_identity = None;
+    }
+
+    /// Content changed without another undo entry, such as a coalesced edit. The new content
+    /// must not reuse an earlier savepoint's identity, even at the same stack position.
+    pub fn amend_current(&mut self) {
+        self.current_identity = Arc::new(());
+    }
+
     /// Undo: `current` becomes redoable; returns the document to make current and the layers it
     /// targeted when it was created.
     pub fn undo(&mut self, current: Arc<Document>) -> Option<(Arc<Document>, LayerTarget)> {
@@ -126,7 +155,8 @@ impl History {
         }
         let label = std::mem::replace(&mut self.current_label, prev.label);
         let layers = std::mem::replace(&mut self.current_layers, prev.layers.clone());
-        self.redo.push(HistoryState { label, doc: current, layers });
+        let identity = std::mem::replace(&mut self.current_identity, prev.identity);
+        self.redo.push(HistoryState { label, doc: current, layers, identity });
         Some((prev.doc, prev.layers))
     }
 
@@ -139,7 +169,8 @@ impl History {
         }
         let label = std::mem::replace(&mut self.current_label, next.label);
         let layers = std::mem::replace(&mut self.current_layers, next.layers.clone());
-        self.undo.push_back(HistoryState { label, doc: current, layers });
+        let identity = std::mem::replace(&mut self.current_identity, next.identity);
+        self.undo.push_back(HistoryState { label, doc: current, layers, identity });
         Some((next.doc, next.layers))
     }
 
@@ -294,6 +325,45 @@ mod tests {
         cur = h.redo(cur).unwrap().0;
         assert_eq!(cur.layers.len(), 2);
         assert!(h.redo(cur.clone()).is_none());
+    }
+
+    #[test]
+    fn saved_identity_survives_navigation_but_not_branching_or_amendment() {
+        let mut h = History::default();
+        let mut cur = Arc::new(base());
+        h.mark_saved();
+        edit(&mut h, &mut cur, "A", |d| d.name = "a".into());
+        assert!(!h.is_saved());
+        cur = h.undo(cur).unwrap().0;
+        assert!(h.is_saved());
+        cur = h.redo(cur).unwrap().0;
+        h.mark_saved();
+        cur = h.undo(cur).unwrap().0;
+        assert!(!h.is_saved());
+        edit(&mut h, &mut cur, "B", |d| d.name = "b".into());
+        assert!(!h.is_saved(), "the same stack index is a different state");
+        h.mark_saved();
+        h.amend_current();
+        assert!(!h.is_saved(), "coalescing changes the state without adding an entry");
+        h.mark_saved();
+        h.forget_saved();
+        assert!(!h.is_saved());
+    }
+
+    #[test]
+    fn saved_identity_does_not_retain_a_purged_document() {
+        let mut h = History::default();
+        let mut cur = Arc::new(base());
+        let saved = Arc::downgrade(&cur);
+        h.mark_saved();
+        edit(&mut h, &mut cur, "A", |d| d.name = "a".into());
+        assert!(saved.upgrade().is_some());
+        h.clear();
+        assert!(saved.upgrade().is_none(), "a savepoint must not retain the saved snapshot");
+        assert!(!h.is_saved());
+        h.mark_saved();
+        h.clear();
+        assert!(h.is_saved(), "purging history does not change the current content");
     }
 
     #[test]

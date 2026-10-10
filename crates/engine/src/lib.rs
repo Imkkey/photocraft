@@ -181,7 +181,10 @@ pub struct DocState {
     pub source_read_only: bool,
     /// Increments on every change; UIs re-render when it moves.
     pub revision: u64,
+    /// Last clean render revision. Use [`Self::mark_saved`] after a successful save.
     pub saved_revision: u64,
+    /// Detect legacy direct writes to `saved_revision` before moving through history.
+    history_saved_revision: u64,
     /// Area changed by the latest revision (None = assume everything changed).
     pub last_damage: Option<photocraft_geom::Rect>,
     /// Coalescing key of the latest history step (see [`Session::execute`]'s `coalesce` param).
@@ -218,6 +221,7 @@ impl DocState {
             source_read_only: false,
             revision: 1,
             saved_revision: 1,
+            history_saved_revision: 1,
             last_damage: None,
             coalesce: None,
             channel_view: Default::default(),
@@ -241,6 +245,35 @@ impl DocState {
     }
     pub fn is_dirty(&self) -> bool {
         self.revision != self.saved_revision
+    }
+
+    /// Mark the current content saved only after a successful write (never for a copy/export).
+    pub fn mark_saved(&mut self) {
+        self.saved_revision = self.revision;
+        self.history_saved_revision = self.saved_revision;
+        self.history.mark_saved();
+    }
+
+    /// Preserve the public revision-based save protocol while history tracks content identity.
+    /// View-only revisions keep a clean document clean. An untracked dirty mutation must not
+    /// inherit the identity of saved content, and an older savepoint must not survive a new
+    /// direct `saved_revision` assignment followed by such a mutation.
+    fn sync_history_saved(&mut self) {
+        if !self.is_dirty() {
+            self.history.mark_saved();
+        } else if self.saved_revision == 0 || self.saved_revision != self.history_saved_revision {
+            self.history.forget_saved();
+        } else if self.history.is_saved() {
+            self.history.amend_current();
+        }
+        self.history_saved_revision = self.saved_revision;
+    }
+
+    fn restore_saved_revision(&mut self) {
+        if self.history.is_saved() {
+            self.saved_revision = self.revision;
+            self.history_saved_revision = self.saved_revision;
+        }
     }
     /// The targeted layers, as history stores them with each state.
     fn layer_target(&self) -> LayerTarget {
@@ -522,6 +555,8 @@ impl Session {
         let mut doc = (*before).clone();
         let mut active = st.active_layer;
         let r = f(&mut doc, &mut active)?;
+        st.sync_history_saved();
+        let clean = !st.is_dirty();
         if let (Some(k), Some(id)) = (restrict, active) {
             channel_cmds::restrict_to_color(&before, &mut doc, id, k);
         }
@@ -537,12 +572,13 @@ impl Session {
         let key = self.coalesce_request.clone();
         let st = self.active_mut().ok_or(EngineError::NoDocument)?;
         let layers = st.layer_target();
-        if key.is_none() || st.coalesce != key || !st.history.can_undo() {
+        if clean || key.is_none() || st.coalesce != key || !st.history.can_undo() {
             st.history.set_current_layers(prior);
             st.history.record(label, before, layers);
             st.history.trim(&st.doc);
         } else {
             st.history.set_current_layers(layers);
+            st.history.amend_current();
         }
         st.coalesce = key;
         st.revision += 1;
@@ -617,6 +653,7 @@ impl Session {
             return false;
         }
         let Some(st) = self.active_mut() else { return false };
+        st.sync_history_saved();
         st.coalesce = None;
         match st.history.undo(st.doc.clone()) {
             Some((mut d, layers)) => {
@@ -630,6 +667,7 @@ impl Session {
                 st.doc = d;
                 restore_target(st, layers);
                 st.revision += 1;
+                st.restore_saved_revision();
                 st.last_damage = damage;
                 true
             }
@@ -642,6 +680,7 @@ impl Session {
             return false;
         }
         let Some(st) = self.active_mut() else { return false };
+        st.sync_history_saved();
         st.coalesce = None;
         match st.history.redo(st.doc.clone()) {
             Some((mut d, layers)) => {
@@ -652,6 +691,7 @@ impl Session {
                 st.doc = d;
                 restore_target(st, layers);
                 st.revision += 1;
+                st.restore_saved_revision();
                 st.last_damage = damage;
                 true
             }
